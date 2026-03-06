@@ -72,6 +72,24 @@ CREATE TABLE IF NOT EXISTS eval_results (
 );
 CREATE INDEX IF NOT EXISTS idx_eval_results_run ON eval_results(eval_run_id);
 CREATE INDEX IF NOT EXISTS idx_eval_results_problem ON eval_results(problem_id);
+
+CREATE TABLE IF NOT EXISTS eval_progress (
+    id                    TEXT PRIMARY KEY,
+    eval_run_id           TEXT NOT NULL REFERENCES eval_runs(id),
+    problem_id            TEXT NOT NULL REFERENCES problems(id),
+    source_eval_result_id TEXT REFERENCES eval_results(id),
+    grade_level           TEXT NOT NULL,
+    standard_code         TEXT NOT NULL,
+    position              INTEGER NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'pending',
+    human_eval_result_id  TEXT REFERENCES eval_results(id),
+    completed_at          TEXT,
+    created_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_progress_run
+    ON eval_progress(eval_run_id);
+CREATE INDEX IF NOT EXISTS idx_eval_progress_run_status
+    ON eval_progress(eval_run_id, status);
 """
 
 
@@ -376,3 +394,225 @@ class ProblemStore:
                     d[col] = bool(d[col])
             results.append(d)
         return results
+
+    # -- Eval Run queries --
+
+    def get_eval_run(self, eval_run_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM eval_runs WHERE id = ?", (eval_run_id,)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def get_eval_run_by_label(self, label: str) -> dict | None:
+        """Fetch most recent eval run with the given label."""
+        row = self._conn.execute(
+            "SELECT * FROM eval_runs WHERE eval_run_label = ? ORDER BY created_at DESC LIMIT 1",
+            (label,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def list_eval_runs(self, eval_type: str | None = None) -> list[dict]:
+        if eval_type is not None:
+            rows = self._conn.execute(
+                "SELECT * FROM eval_runs WHERE eval_type = ? ORDER BY created_at",
+                (eval_type,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM eval_runs ORDER BY created_at"
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    # -- Eval Progress CRUD --
+
+    def seed_eval_progress(
+        self,
+        eval_run_id: str,
+        source_eval_run_id: str | None,
+        batch_id: str,
+        probs_per_std: int | None = None,
+        grades: list[str] | None = None,
+    ) -> int:
+        """Seed progress rows from auto-eval results (or problems if no source_eval_run_id).
+        Returns count seeded."""
+        now = _now_iso()
+
+        if source_eval_run_id is not None:
+            # Source from eval_results
+            query = """
+                SELECT er.id as source_id, er.problem_id, er.grade_level, er.standard_code
+                FROM eval_results er
+                WHERE er.eval_run_id = ?
+                ORDER BY er.grade_level, er.standard_code, er.created_at
+            """
+            params: list = [source_eval_run_id]
+            if grades:
+                placeholders = ",".join("?" for _ in grades)
+                query = query.replace(
+                    "WHERE er.eval_run_id = ?",
+                    f"WHERE er.eval_run_id = ? AND er.grade_level IN ({placeholders})"
+                )
+                params = [source_eval_run_id] + list(grades)
+            rows = self._conn.execute(query, params).fetchall()
+            items = [_row_to_dict(r) for r in rows]
+        else:
+            # Source from problems table
+            query = """
+                SELECT p.id as problem_id, p.grade_level, p.standard_code, NULL as source_id
+                FROM problems p
+                WHERE p.batch_id = ?
+                ORDER BY p.grade_level, p.standard_code, p.position
+            """
+            params = [batch_id]
+            if grades:
+                placeholders = ",".join("?" for _ in grades)
+                query = query.replace(
+                    "WHERE p.batch_id = ?",
+                    f"WHERE p.batch_id = ? AND p.grade_level IN ({placeholders})"
+                )
+                params = [batch_id] + list(grades)
+            rows = self._conn.execute(query, params).fetchall()
+            items = [_row_to_dict(r) for r in rows]
+
+        # Apply probs_per_std filter
+        if probs_per_std is not None:
+            by_std: dict[str, list] = {}
+            for item in items:
+                key = (item["grade_level"], item["standard_code"])
+                by_std.setdefault(key, []).append(item)
+            filtered: list[dict] = []
+            for std_items in by_std.values():
+                filtered.extend(std_items[:probs_per_std])
+            items = filtered
+
+        for position, item in enumerate(items):
+            self._conn.execute(
+                """INSERT INTO eval_progress
+                   (id, eval_run_id, problem_id, source_eval_result_id,
+                    grade_level, standard_code, position, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    _new_id(),
+                    eval_run_id,
+                    item["problem_id"],
+                    item.get("source_id"),
+                    item["grade_level"],
+                    item["standard_code"],
+                    position,
+                    now,
+                ),
+            )
+        return len(items)
+
+    def get_eval_progress(
+        self, eval_run_id: str, status: str | None = None
+    ) -> list[dict]:
+        """Get progress rows for a run, ordered by grade/standard/position."""
+        if status is not None:
+            rows = self._conn.execute(
+                """SELECT * FROM eval_progress
+                   WHERE eval_run_id = ? AND status = ?
+                   ORDER BY grade_level, standard_code, position""",
+                (eval_run_id, status),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT * FROM eval_progress
+                   WHERE eval_run_id = ?
+                   ORDER BY grade_level, standard_code, position""",
+                (eval_run_id,),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    _EVAL_FLAG_COLS = (
+        "bad_answer_matching", "incorrect_answer", "multiple_correct",
+        "ambiguous", "missing_info", "answer_in_q", "open_ended",
+        "needs_graphic", "bad_format", "unanswerable", "other_issue",
+        "bad_problem", "problem_correct",
+    )
+
+    def get_eval_progress_item(self, progress_id: str) -> dict | None:
+        """Enriched item: JOINs eval_progress + problems + eval_results(auto+human).
+        Returns dict with progress fields + problem_* + auto_* + human_* prefixed keys."""
+        row = self._conn.execute(
+            """
+            SELECT
+                ep.id, ep.eval_run_id, ep.problem_id, ep.source_eval_result_id,
+                ep.grade_level, ep.standard_code, ep.position, ep.status,
+                ep.human_eval_result_id, ep.completed_at, ep.created_at,
+                p.problem_text  AS problem_problem_text,
+                p.choices       AS problem_choices,
+                p.solution_text AS problem_solution_text,
+                ae.id                   AS auto_id,
+                ae.bad_answer_matching  AS auto_bad_answer_matching,
+                ae.incorrect_answer     AS auto_incorrect_answer,
+                ae.multiple_correct     AS auto_multiple_correct,
+                ae.ambiguous            AS auto_ambiguous,
+                ae.missing_info         AS auto_missing_info,
+                ae.answer_in_q          AS auto_answer_in_q,
+                ae.open_ended           AS auto_open_ended,
+                ae.needs_graphic        AS auto_needs_graphic,
+                ae.bad_format           AS auto_bad_format,
+                ae.unanswerable         AS auto_unanswerable,
+                ae.other_issue          AS auto_other_issue,
+                ae.bad_problem          AS auto_bad_problem,
+                ae.comments             AS auto_comments,
+                he.id                   AS human_id,
+                he.bad_answer_matching  AS human_bad_answer_matching,
+                he.incorrect_answer     AS human_incorrect_answer,
+                he.multiple_correct     AS human_multiple_correct,
+                he.ambiguous            AS human_ambiguous,
+                he.missing_info         AS human_missing_info,
+                he.answer_in_q          AS human_answer_in_q,
+                he.open_ended           AS human_open_ended,
+                he.needs_graphic        AS human_needs_graphic,
+                he.bad_format           AS human_bad_format,
+                he.unanswerable         AS human_unanswerable,
+                he.other_issue          AS human_other_issue,
+                he.bad_problem          AS human_bad_problem,
+                he.user_answer          AS human_user_answer,
+                he.comments             AS human_comments,
+                he.problem_correct      AS human_problem_correct
+            FROM eval_progress ep
+            LEFT JOIN problems p ON ep.problem_id = p.id
+            LEFT JOIN eval_results ae ON ep.source_eval_result_id = ae.id
+            LEFT JOIN eval_results he ON ep.human_eval_result_id = he.id
+            WHERE ep.id = ?
+            """,
+            (progress_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = _row_to_dict(row)
+        if d.get("problem_choices"):
+            try:
+                d["problem_choices"] = json.loads(d["problem_choices"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        for prefix in ("auto_", "human_"):
+            for col in self._EVAL_FLAG_COLS:
+                key = f"{prefix}{col}"
+                if d.get(key) is not None:
+                    d[key] = bool(d[key])
+        return d
+
+    def complete_eval_progress(
+        self, progress_id: str, human_eval_result_id: str
+    ) -> None:
+        """Set status='completed', human_eval_result_id, completed_at."""
+        self._conn.execute(
+            """UPDATE eval_progress
+               SET status = 'completed', human_eval_result_id = ?, completed_at = ?
+               WHERE id = ?""",
+            (human_eval_result_id, _now_iso(), progress_id),
+        )
+
+    def update_eval_result(self, eval_result_id: str, updates: dict) -> None:
+        """Update specified columns on an existing eval_results row."""
+        if not updates:
+            return
+        set_clause = ", ".join(f"{col} = ?" for col in updates)
+        values = list(updates.values()) + [eval_result_id]
+        self._conn.execute(
+            f"UPDATE eval_results SET {set_clause} WHERE id = ?", values
+        )
