@@ -14,11 +14,11 @@ from mathkg.store import ProblemStore
 
 def _parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-name", type=str, default="batch003",
+    parser.add_argument("--batch-name", type=str, default="batch004",
                         help="Batch name to load problems from")
     parser.add_argument("--probs-per-std", type=int, default=2,
                         help="Number of problems per standard to load")
-    parser.add_argument("--problem-list", type=str, default="batch003-good.txt",
+    parser.add_argument("--problem-list", type=str, default="batch004-good.txt",
                         help="Filename under data/ with one problem ID per line")
     return parser.parse_args(sys.argv[1:])
 
